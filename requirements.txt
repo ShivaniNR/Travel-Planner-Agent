@@ -3,3 +3,4 @@ langchain_community
 streamlit
 langchain_tavily
 psutil
+langchain_google_genai

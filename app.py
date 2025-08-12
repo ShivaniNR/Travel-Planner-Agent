@@ -7,6 +7,7 @@ from langchain.agents import create_react_agent
 from langchain.prompts import PromptTemplate
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain.agents import AgentExecutor
+from langchain.tools import Tool
 import time
 
 # Setup streamlit app
@@ -16,6 +17,7 @@ st.title('AI Travel Planner')
 load_dotenv()
 os.environ['TAVILY_API_KEY'] = os.getenv('TAVILY_API_KEY')
 os.environ['GOOGLE_API_KEY'] = os.getenv('GOOGLE_API_KEY')
+os.environ['GOOGLE_MAPS_PLATFORM_API_KEY'] = os.getenv('GOOGLE_MAPS_PLATFORM_API_KEY')
 
 # System resource monitoring
 def monitor_system():
@@ -29,8 +31,112 @@ def monitor_system():
         return None, None
 
 
+def get_places_info(location: str):
+    """Fetches basic information about a location using Google Maps API."""
+    try:
+        url = "https://places.googleapis.com/v1/places:searchText"
+
+        headers = {
+                    'Content-Type': 'application/json',
+                    'X-Goog-Api-Key': os.environ['GOOGLE_MAPS_PLATFORM_API_KEY'],
+                    'X-Goog-FieldMask': 'places.displayName,places.formattedAddress,places.rating,places.userRatingCount,places.priceLevel,places.types,places.businessStatus,places.websiteUri,places.regularOpeningHours'
+                }
+                
+        data = {
+            "textQuery": location,
+            "maxResultCount": 5
+        }
+
+        response = requests.post(url, headers=headers, json=data, timeout=10)
+
+        if response.status_code == 200:
+            result = response.json()
+            places = result.get('places', [])
+            
+            if not places:
+                return f"No places found for: {location}"
+            
+            # Format results simply
+            output = f"Places found for '{location}':\n\n"
+            for i, place in enumerate(places, 1):
+                name = place.get('displayName', {}).get('text', 'Unknown')
+                address = place.get('formattedAddress', 'No address')
+                rating = place.get('rating', 'No rating')
+                rating_count = place.get('userRatingCount', 0)
+                price_level = place.get('priceLevel', 'PRICE_LEVEL_UNSPECIFIED')
+                types = place.get('types', [])
+                business_status = place.get('businessStatus', 'OPERATIONAL')
+                website = place.get('websiteUri', 'No website')
+
+                # Format price level
+                price_display = {
+                    'PRICE_LEVEL_FREE': 'Free',
+                    'PRICE_LEVEL_INEXPENSIVE': '$',
+                    'PRICE_LEVEL_MODERATE': '$$', 
+                    'PRICE_LEVEL_EXPENSIVE': '$$$',
+                    'PRICE_LEVEL_VERY_EXPENSIVE': '$$$$'
+                }.get(price_level, 'Price not specified')
+                
+                # Extract main business type
+                main_type = 'Business'
+                if types:
+                    readable_types = {
+                        'restaurant': 'Restaurant',
+                        'tourist_attraction': 'Attraction', 
+                        'lodging': 'Hotel/Lodging',
+                        'park': 'Park',
+                        'museum': 'Museum',
+                        'store': 'Store'
+                    }
+                    for place_type in types:
+                        if place_type in readable_types:
+                            main_type = readable_types[place_type]
+                            break
+                
+                output += f"{i}. {name} ({main_type})\n"
+                output += f"   📍 {address}\n"
+                
+                if rating != 'No rating':
+                    output += f"   ⭐ {rating}/5 ({rating_count} reviews)\n"
+                else:
+                    output += f"   ⭐ No rating available\n"
+                
+                if price_display != 'Price not specified':
+                    output += f"   💰 {price_display}\n"
+                
+                if website != 'No website':
+                    output += f"   🌐 {website}\n"
+                
+                if business_status != 'OPERATIONAL':
+                    output += f"   ⚠️  Status: {business_status}\n"
+                
+                output += "\n"
+            
+            return output
+        else:
+            return f"Error searching places: {response.status_code}"
+
+
+    except Exception as e:
+        st.error(f"❌ Failed to initialize: {str(e)}")
+        st.info("Check your API keys in the .env file")
+
+
+places_tool = Tool(
+    name="places_info", 
+    description="Find specific businesses with ratings, addresses, prices, hours, and websites. Use for: 'top attractions [location]', 'best restaurants [location]', 'hotels [location]'. Returns detailed business information from Google Places API.",
+    func=get_places_info
+)
+
 search_tool = TavilySearch(max_results=3)
-tools = [search_tool]
+tavily_tool = Tool(
+    name="tavily_search",
+    description="Search web for general travel information, guides, articles, transportation tips, and practical advice. Use for overviews and non-business-specific information.",
+    func=search_tool.invoke
+)
+
+
+tools = [tavily_tool, places_tool]
 
 # OPTIMIZED PROMPTS FOR GEMINI
 researcher_agent_prompt = PromptTemplate(
@@ -39,11 +145,18 @@ researcher_agent_prompt = PromptTemplate(
 Available tools: {tools}
 Tool names: [{tool_names}]
 
-EFFICIENT RESEARCH STRATEGY (4-6 searches max):
-1. Search top attractions and activities
-2. Search accommodations and neighborhoods  
-3. Search restaurants and local cuisine
-4. Search transportation and practical tips
+MANDATORY RESEARCH SEQUENCE (follow exactly):
+1. tavily_search: Get general travel guide overview and transportation tips
+2. places_info: Find top-rated attractions with addresses and ratings
+3. places_info: Find best restaurants with ratings, prices, and contact info  
+4. places_info: Find hotels/accommodations with ratings and prices
+5. tavily_search: Get additional practical tips if needed (optional)
+
+TOOL PURPOSES:
+- tavily_search: General guides, articles, transportation, practical tips
+- places_info: Specific businesses with ratings, addresses, prices, hours
+
+YOU MUST call places_info for each major category (attractions, restaurants, hotels).
 
 Follow this format exactly:
 Question: the input question you must answer
@@ -81,6 +194,7 @@ Thought: what I need to do
 Action: the action to take, should be one of [{tool_names}]
 Action Input: [search query if needed]
 Observation: [result if searched]
+... (repeat only if critical info missing)
 Thought: I can create the itinerary now
 Final Answer: [complete day-by-day itinerary with timing, activities, restaurants, and tips]
 
@@ -121,7 +235,6 @@ if not os.environ.get('GOOGLE_API_KEY'):
 # Initialize components
 try:
     llm = get_gemini_llm()
-    tools = [search_tool]
     
     # Get tool descriptions
     tools_desc = "\n".join([f"{tool.name}: {tool.description}" for tool in tools])
@@ -130,7 +243,7 @@ try:
     # FIXED EXECUTORS with all required variables
     researcher_agent = create_react_agent(
         llm=llm, 
-        tools=tools, 
+        tools=[tavily_tool, places_tool], 
         prompt=researcher_agent_prompt.partial(
             tools=tools_desc, 
             tool_names=tool_names
@@ -139,7 +252,7 @@ try:
     
     researcher_executor = AgentExecutor(
         agent=researcher_agent,
-        tools=tools,
+        tools=[tavily_tool, places_tool],
         verbose=True,
         handle_parsing_errors=True,
         max_iterations=8,
@@ -149,7 +262,7 @@ try:
     
     planner_agent = create_react_agent(
         llm=llm, 
-        tools=tools, 
+        tools=[tavily_tool], 
         prompt=planner_agent_prompt.partial(
             tools=tools_desc, 
             tool_names=tool_names
@@ -158,7 +271,7 @@ try:
     
     planner_executor = AgentExecutor(
         agent=planner_agent,
-        tools=tools,
+        tools=[tavily_tool],
         verbose=True,
         handle_parsing_errors=True,
         max_iterations=6,
@@ -180,33 +293,6 @@ except Exception as e:
         st.write("Search tool name:", getattr(search_tool, 'name', 'No name attribute'))
     st.stop()
 
-
-# System status
-# col1, col2, col3 = st.columns(3)
-# with col1:
-#     if st.button("🌡️ System Check"):
-#         cpu_usage, memory_usage = monitor_system()
-#         if cpu_usage and memory_usage:
-#             if cpu_usage < 50:
-#                 st.success(f"✅ CPU: {cpu_usage}%")
-#             else:
-#                 st.warning(f"⚠️ CPU: {cpu_usage}%")
-#             st.info(f"💾 Memory: {memory_usage}%")
-#         else:
-#             st.info("Install 'psutil' for system monitoring")
-
-# with col2:
-#     if st.button("🧪 Test Gemini"):
-#         try:
-#             test_response = llm.invoke("Say 'Gemini working!' in one sentence")
-#             st.success(f"✅ {test_response.content}")
-#         except Exception as e:
-#             st.error(f"❌ Gemini test failed: {str(e)}")
-
-# with col3:
-#     emergency_stop = st.button("🛑 STOP", type="primary")
-#     if emergency_stop:
-#         st.stop()
 
 # Input fields
 destination = st.text_input("🗺️ Destination:", placeholder="e.g., Tokyo, Paris, New York")
@@ -336,44 +422,12 @@ Create a practical day-by-day itinerary with specific timing, activities, restau
                     mime="text/plain",
                     key="download_complete"  # Unique key to prevent conflicts
                 )
-                # col1, col2 = st.columns(2)
                 
-                # with col1:
-                    
-                
-                # with col2:
-                #     # Quick summary
-                #     summary = f"{st.session_state.last_destination} • {st.session_state.last_preferences['num_days']} days • {st.session_state.last_preferences['budget']} • Generated: {time.strftime('%Y-%m-%d %H:%M')}"
-                #     st.download_button(
-                #         label="📋 Download Summary",
-                #         data=f"TRIP SUMMARY\n{summary}\n\n{st.session_state.itinerary_results}",
-                #         file_name=f"{st.session_state.last_destination.replace(' ', '_')}_summary.txt",
-                #         mime="text/plain",
-                #         key="download_summary"  # Unique key to prevent conflicts
-                #     )
             
             # Research details
             with st.expander("📊 View Detailed Research"):
                 st.markdown(st.session_state.research_results[:2000] + "..." if len(st.session_state.research_results) > 2000 else st.session_state.research_results)
             
-            # Feedback section
-            st.markdown("---")
-            with st.container():
-                st.markdown("### 💭 Rate your experience:")
-                col1, col2, col3, col4 = st.columns(4)
-                with col1:
-                    if st.button("😍 Excellent"):
-                        st.balloons()
-                        st.success("Thank you! Gemini rocks! 🚀")
-                with col2:
-                    if st.button("👍 Good"):
-                        st.success("Thanks for the feedback!")
-                with col3:
-                    if st.button("😐 Okay"):
-                        st.info("We'll keep improving!")
-                with col4:
-                    if st.button("👎 Poor"):
-                        st.info("Sorry! Please try different preferences.")
                         
         except Exception as e:
             st.error(f"❌ Error occurred: {str(e)}")
@@ -412,51 +466,3 @@ Create a practical day-by-day itinerary with specific timing, activities, restau
             """)
     else:
         st.warning("⚠️ Please enter both destination and number of days.")
-
-# # Display previously generated results if they exist (after download button clicks)
-# if st.session_state.last_destination:
-#     st.markdown("---")
-#     st.markdown("## 📋 Previously Generated Itinerary")
-#     st.info(f"🗺️ **{st.session_state.last_destination}** • {st.session_state.last_preferences['num_days']} days • Generated with Google Gemini")
-    
-#     # Show results
-#     with st.container():
-#         st.markdown("### 🗺️ Your Travel Itinerary")
-#         st.markdown(st.session_state.itinerary_results)
-        
-#         # Persistent download buttons (always available)
-#         col1, col2 = st.columns(2)
-        
-#         with col1:
-#             itinerary_text = f"""
-#                 {st.session_state.last_destination.upper()} - {st.session_state.last_preferences['num_days']} DAY ITINERARY
-#                 Budget: {st.session_state.last_preferences['budget']} | Style: {st.session_state.last_preferences['travel_style']} | Group: {st.session_state.last_preferences['group_size']}
-#                 {'='*50}
-
-#                 {st.session_state.itinerary_results}
-
-#                 {'='*50}
-#                 Research Data:
-#                 {st.session_state.research_results}
-#                 """
-#             st.download_button(
-#                 label="📄 Download Complete Itinerary",
-#                 data=itinerary_text,
-#                 file_name=f"{st.session_state.last_destination.replace(' ', '_')}_{st.session_state.last_preferences['num_days']}days.txt",
-#                 mime="text/plain",
-#                 key="persistent_download_complete"
-#             )
-        
-        
-#         with col2:
-#             if st.button("🗑️ Clear Results", key="clear_results"):
-#                 st.session_state.itinerary_results = None
-#                 st.session_state.research_results = None
-#                 st.session_state.generation_time = None
-#                 st.session_state.last_destination = None
-#                 st.session_state.last_preferences = None
-#                 st.rerun()
-        
-#         # Research details (persistent)
-#         with st.expander("📊 View Detailed Research"):
-#             st.markdown(st.session_state.research_results[:2000] + "..." if len(st.session_state.research_results) > 2000 else st.session_state.research_results)
